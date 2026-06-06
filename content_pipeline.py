@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic
+import feedparser
 import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
@@ -29,6 +30,16 @@ MODEL = "claude-sonnet-4-5"
 OUTPUTS_DIR = Path(__file__).parent / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
 PORTFOLIO_REPO = "jerichoNega/portfolio"  # GitHub repo for blog publishing
+
+# ── News feeds (same sources as MyNewsJericho) ────────────────────────────────
+NEWS_FEEDS = [
+    {"name": "OpenAI",        "url": "https://openai.com/news/rss.xml"},
+    {"name": "Google AI",     "url": "https://blog.google/technology/ai/rss/"},
+    {"name": "VentureBeat",   "url": "https://venturebeat.com/category/ai/feed/"},
+    {"name": "TechCrunch AI", "url": "https://techcrunch.com/category/artificial-intelligence/feed/"},
+    {"name": "arXiv cs.AI",   "url": "https://arxiv.org/rss/cs.AI"},
+    {"name": "HackerNews AI", "url": "https://hnrss.org/frontpage?q=AI"},
+]
 
 # Font paths (macOS — falls back gracefully)
 FONT_PATHS = [
@@ -51,10 +62,142 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
     return ImageFont.load_default()
 
 
+# ── Research ─────────────────────────────────────────────────────────────────
+
+def research_synthesis_prompt(topic: str, raw_content: str) -> str:
+    return f"""You are extracting key research facts for a content writer.
+
+Topic: {topic}
+
+Raw source content:
+{raw_content}
+
+Extract and return ONLY:
+- 3–5 specific facts, stats, or data points (include source name in parentheses if available)
+- 2–3 recent developments or news items directly relevant to this topic
+- 1–2 notable debates, tensions, or opposing views in this space
+- Any specific names, companies, numbers, or dates worth referencing
+
+Format as short bullet points only. Be specific — no vague summaries. No prose paragraphs. Max 300 words."""
+
+
+async def fetch_article_body(url: str) -> str:
+    """Fetch and extract clean article text from a URL."""
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(url)
+        text = trafilatura.extract(downloaded)
+        return text[:3000] if text else ""
+    except Exception:
+        return ""
+
+
+async def gather_web_research(topic: str, client: anthropic.AsyncAnthropic) -> str | None:
+    """Search the web for current info on the topic and return a research brief."""
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        print("  \033[33m  duckduckgo-search not installed — skipping research.\033[0m")
+        return None
+
+    try:
+        print("  \033[2mSearching the web…\033[0m", end="", flush=True)
+
+        with DDGS() as ddg:
+            results = list(ddg.text(topic, max_results=8))
+
+        if not results:
+            print("\r  \033[33m  No results found — generating without research.\033[0m")
+            return None
+
+        print(f"\r  \033[2mFetching sources…\033[0m", end="", flush=True)
+
+        bodies = []
+        for r in results[:5]:
+            url = r.get("href", "")
+            if not url:
+                continue
+            body = await fetch_article_body(url)
+            if body and len(body) > 200:
+                bodies.append(f"SOURCE: {r.get('title', url)}\nURL: {url}\n\n{body}")
+                if len(bodies) >= 3:
+                    break
+
+        # Fall back to DDG snippets if no full bodies
+        if not bodies:
+            bodies = [f"- {r.get('title', '')}: {r.get('body', '')}" for r in results[:6]]
+
+        raw = "\n\n---\n\n".join(bodies)
+
+        print(f"\r  \033[2mSynthesizing…\033[0m", end="", flush=True)
+        brief = await call_claude(client, research_synthesis_prompt(topic, raw), max_tokens=500)
+        print(f"\r  \033[32m✓  Research ready ({len(results)} sources)\033[0m          ")
+        return brief
+
+    except Exception as e:
+        print(f"\r  \033[33m  Research failed ({e}) — generating without it.\033[0m")
+        return None
+
+
+def fetch_news_articles(max_per_feed: int = 5) -> list[dict]:
+    """Pull recent articles from all configured news feeds."""
+    articles = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; content-bot/1.0)"}
+    for feed in NEWS_FEEDS:
+        try:
+            resp = requests.get(feed["url"], headers=headers, timeout=8)
+            parsed = feedparser.parse(resp.text)
+            for entry in parsed.entries[:max_per_feed]:
+                title = entry.get("title", "").strip()
+                link = entry.get("link", "").strip()
+                if not title or not link:
+                    continue
+                articles.append({
+                    "source": feed["name"],
+                    "title": title,
+                    "link": link,
+                    "summary": entry.get("summary", "")[:300],
+                })
+        except Exception:
+            continue
+    return articles
+
+
+def select_news_article(articles: list[dict]) -> dict | None:
+    """Display fetched articles and let the user pick one."""
+    if not articles:
+        print("\033[31m  No articles fetched. Check your connection.\033[0m")
+        return None
+
+    shown = articles[:15]
+
+    print(f"\n\033[1m\033[36m{'━' * 70}\033[0m")
+    print(f"\033[1m\033[36m  Latest News — pick one to write about\033[0m")
+    print(f"\033[1m\033[36m{'━' * 70}\033[0m\n")
+
+    for i, a in enumerate(shown):
+        print(f"  \033[1m[{i+1:2}]\033[0m  \033[36m{a['source']}\033[0m")
+        print(f"        {a['title'][:80]}")
+        print()
+
+    try:
+        choice = input(f"  \033[1mPick a number (1–{len(shown)}), or Enter to cancel:\033[0m  ").strip()
+        if not choice:
+            return None
+        idx = int(choice) - 1
+        if 0 <= idx < len(shown):
+            return shown[idx]
+    except (ValueError, KeyboardInterrupt):
+        pass
+    return None
+
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-def linkedin_prompt(topic: str) -> str:
+def linkedin_prompt(topic: str, research: str | None = None) -> str:
+    research_block = f"\n\nCURRENT RESEARCH & FACTS — use these to make the post specific and grounded. Reference real details where they fit naturally:\n{research}\n" if research else ""
     return f"""Write a LinkedIn post about: {topic}
+{research_block}
 
 Requirements:
 - 150-200 words (count carefully)
@@ -76,8 +219,10 @@ Then provide a JSON object on one line:
 Set create=true only if a visual card would genuinely add value to this specific topic (data, lists, frameworks). Otherwise false."""
 
 
-def email_hook_prompt(topic: str) -> str:
+def email_hook_prompt(topic: str, research: str | None = None) -> str:
+    research_block = f"\n\nCURRENT RESEARCH & FACTS — pull from these to make the hook specific, not generic:\n{research}\n" if research else ""
     return f"""Write an email hook for: {topic}
+{research_block}
 
 Requirements:
 - Exactly 2-3 lines
@@ -92,8 +237,10 @@ Requirements:
 Output ONLY the 2-3 lines. Nothing else."""
 
 
-def blog_post_prompt(topic: str) -> str:
+def blog_post_prompt(topic: str, research: str | None = None) -> str:
+    research_block = f"\n\nCURRENT RESEARCH & FACTS — weave specific details, stats, and developments from this into the article. Don't list them robotically — use them where they strengthen the argument:\n{research}\n" if research else ""
     return f"""Write a complete blog article about: {topic}
+{research_block}
 
 WRITING RULES — follow all of these exactly:
 - NO em dashes (—). Use commas, periods, or a new sentence instead.
@@ -807,22 +954,31 @@ def print_files_summary(files: list[tuple[str, Path]]):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def run(topic: str):
+async def run(topic: str, research_brief: str | None = None, client: anthropic.AsyncAnthropic | None = None):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = safe_filename(topic)
 
     print(f"\n\033[1m\033[36m{'━' * 70}\033[0m")
-    print(f"\033[1m\033[36m  Content Pipeline  ·  Generating 3 outputs in parallel…\033[0m")
+    print(f"\033[1m\033[36m  Content Pipeline\033[0m")
     print(f"\033[1m\033[36m  Topic: {topic[:60]}\033[0m")
     print(f"\033[1m\033[36m{'━' * 70}\033[0m\n")
 
-    # ── Parallel API calls ───────────────────────────────────────────────────
-    ai = anthropic.AsyncAnthropic()
+    ai = client or anthropic.AsyncAnthropic()
 
+    # ── Research step ────────────────────────────────────────────────────────
+    if research_brief is None:
+        research_brief = await gather_web_research(topic, ai)
+
+    if research_brief:
+        print(f"\n\033[2m  Generating 3 outputs in parallel with research context…\033[0m\n")
+    else:
+        print(f"\n\033[2m  Generating 3 outputs in parallel…\033[0m\n")
+
+    # ── Parallel API calls ───────────────────────────────────────────────────
     linkedin_raw, email_raw, blog_raw = await asyncio.gather(
-        call_claude(ai, linkedin_prompt(topic)),
-        call_claude(ai, email_hook_prompt(topic)),
-        call_claude(ai, blog_post_prompt(topic), max_tokens=3000),
+        call_claude(ai, linkedin_prompt(topic, research_brief)),
+        call_claude(ai, email_hook_prompt(topic, research_brief)),
+        call_claude(ai, blog_post_prompt(topic, research_brief), max_tokens=3000),
     )
 
     # ── Parse responses ──────────────────────────────────────────────────────
@@ -1147,9 +1303,51 @@ def maybe_post_to_linkedin(text: str, image_path: Path | None):
         print(f"  \033[2mContent saved to file — you can post manually.\033[0m")
 
 
+async def run_news_mode():
+    """Fetch latest news, let user pick an article, generate content about it."""
+    print(f"\n\033[1m\033[36m{'━' * 70}\033[0m")
+    print(f"\033[1m\033[36m  News Mode  ·  Fetching latest articles…\033[0m")
+    print(f"\033[1m\033[36m{'━' * 70}\033[0m")
+
+    articles = fetch_news_articles()
+    article = select_news_article(articles)
+
+    if not article:
+        print("\n  Cancelled.")
+        return
+
+    topic = article["title"]
+    print(f"\n  \033[32m✓  Selected:\033[0m {topic[:70]}")
+    print(f"  \033[2m  {article['source']} — {article['link'][:60]}\033[0m\n")
+
+    # Fetch full article body and synthesize as research brief
+    ai = anthropic.AsyncAnthropic()
+
+    print("  \033[2mFetching article content…\033[0m", end="", flush=True)
+    body = await fetch_article_body(article["link"])
+    raw = f"SOURCE: {article['source']}\nTITLE: {article['title']}\nURL: {article['link']}\n\n{body or article['summary']}"
+
+    print("\r  \033[2mSynthesizing research brief…\033[0m", end="", flush=True)
+    brief = await call_claude(ai, research_synthesis_prompt(topic, raw), max_tokens=500)
+    print(f"\r  \033[32m✓  Research brief ready\033[0m                    ")
+
+    await run(topic, research_brief=brief, client=ai)
+
+
 def main():
-    if len(sys.argv) > 1:
-        topic = " ".join(sys.argv[1:])
+    news_mode = "--news" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("\033[31mError: ANTHROPIC_API_KEY environment variable is not set.\033[0m")
+        sys.exit(1)
+
+    if news_mode:
+        asyncio.run(run_news_mode())
+        return
+
+    if args:
+        topic = " ".join(args)
     else:
         try:
             topic = input("\033[1mEnter your topic or brief:\033[0m  ").strip()
@@ -1159,10 +1357,6 @@ def main():
 
     if not topic:
         print("Error: topic cannot be empty.")
-        sys.exit(1)
-
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("\033[31mError: ANTHROPIC_API_KEY environment variable is not set.\033[0m")
         sys.exit(1)
 
     asyncio.run(run(topic))
